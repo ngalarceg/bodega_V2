@@ -1,6 +1,5 @@
 const dotenv = require('dotenv');
-const mongoose = require('mongoose');
-const User = require('./models/User');
+const { sequelize, User } = require('./models');
 const { hashPassword } = require('./utils/password');
 
 dotenv.config();
@@ -14,22 +13,16 @@ const email = (process.env.SEED_ADMIN_EMAIL || DEFAULT_EMAIL).toLowerCase();
 const password = process.env.SEED_ADMIN_PASSWORD || DEFAULT_PASSWORD;
 const role = 'ADMIN';
 
-const MONGODB_URI =
-  process.env.MONGODB_URI ||
-  'mongodb+srv://Cesfam:Cesfam.2025@basededatos1.hwq53bl.mongodb.net/?retryWrites=true&w=majority&appName=Basededatos1';
-
 async function main() {
   try {
-    console.log('Connecting to MongoDB...');
-    await mongoose.connect(MONGODB_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-    });
-    console.log('MongoDB connection established');
+    console.log('Conectando a SQL Server...');
+    await sequelize.authenticate();
+    await sequelize.sync();
+    console.log('Conexión establecida.');
 
-    const existingUser = await User.findOne({ email });
+    const existingUser = await User.findOne({ where: { email } });
     if (existingUser) {
-      console.log('A user with this email already exists. Skipping creation.');
+      console.log('Ya existe un usuario con este correo. Se omite la creación.');
       return;
     }
 
@@ -51,8 +44,8 @@ async function main() {
     console.error('Error al crear el usuario administrador:', error);
     process.exitCode = 1;
   } finally {
-    await mongoose.disconnect();
-    console.log('Conexión a MongoDB cerrada');
+    await sequelize.close();
+    console.log('Conexión a SQL Server cerrada');
   }
 }
 

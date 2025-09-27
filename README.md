@@ -1,7 +1,8 @@
 # Aplicación de administración de bodega
 
 Solución full stack para la gestión de inventario de una bodega corporativa. El frontend está
-construido con **React + Vite** y el backend con **Node.js + Express** conectándose a **MongoDB**.
+construido con **React + Vite** y el backend con **Node.js + Express** conectándose a **SQL Server
+(SQL Express)** mediante **Sequelize**.
 El sistema contempla tres roles de usuario:
 
 - **Administrador**: control total, crea usuarios, registra productos, carga guías y gestiona
@@ -22,7 +23,7 @@ El sistema contempla tres roles de usuario:
 ## Requisitos previos
 
 - Node.js 18+
-- MongoDB 6+
+- SQL Server Express 2019+ (o cualquier edición de SQL Server compatible)
 
 ## Configuración rápida
 
@@ -32,7 +33,8 @@ El sistema contempla tres roles de usuario:
    cp backend/.env.example backend/.env
    cp frontend/.env.example frontend/.env
    ```
-   Ajusta `MONGODB_URI` y `JWT_SECRET` en `backend/.env` según tu entorno. Define `VITE_API_URL`
+   Ajusta las variables `SQLSERVER_HOST`, `SQLSERVER_PORT`, `SQLSERVER_DATABASE`, `SQLSERVER_USER`,
+   `SQLSERVER_PASSWORD` y `JWT_SECRET` en `backend/.env` según tu entorno. Define `VITE_API_URL`
    (por defecto `http://localhost:4000/api`).
 3. Instalar dependencias (requiere acceso a npm):
    ```bash
@@ -103,7 +105,7 @@ backend/
   src/
     controllers/    # Lógica de negocio para auth, productos y guías
     middleware/     # Autenticación y autorización JWT
-    models/         # Modelos Mongoose (User, Product, DispatchGuide, Assignment)
+    models/         # Modelos Sequelize (User, Product, DispatchGuide, Assignment)
     routes/         # Definición de rutas Express
     services/       # Servicio simulado de Active Directory
     utils/          # Utilidades para hashing de contraseñas
@@ -119,7 +121,7 @@ frontend/
 
 ## Notas
 
-- Al asignar o desasignar un producto el sistema crea un registro en la colección `assignments`
+- Al asignar o desasignar un producto el sistema crea un registro en la tabla `assignments`
   indicando fecha, ubicación, usuario de Active Directory y quién ejecutó la acción.
 - Los archivos de guías quedan disponibles mediante `/uploads/<archivo>` y protegidos por JWT
   cuando se descargan a través del endpoint dedicado.

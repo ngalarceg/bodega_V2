@@ -1,5 +1,6 @@
-const mongoose = require('mongoose');
-const User = require('../models/User');
+const { Op } = require('sequelize');
+const { isUUID } = require('validator');
+const { User } = require('../models');
 const { hashPassword } = require('../utils/password');
 
 const ALLOWED_ROLES = ['ADMIN', 'MANAGER', 'VIEWER'];
@@ -25,7 +26,9 @@ function formatAdAccount(value) {
 
 exports.listUsers = async (req, res) => {
   try {
-    const users = await User.find().sort({ createdAt: -1 });
+    const users = await User.findAll({
+      order: [['createdAt', 'DESC']],
+    });
     res.json(users.map((user) => user.toJSON()));
   } catch (error) {
     console.error('listUsers error', error);
@@ -46,7 +49,7 @@ exports.createUser = async (req, res) => {
         .json({ message: 'Nombre, correo y contraseña son obligatorios.' });
     }
 
-    const existingUser = await User.findOne({ email: trimmedEmail });
+    const existingUser = await User.findOne({ where: { email: trimmedEmail } });
     if (existingUser) {
       return res.status(409).json({ message: 'El correo ya está registrado.' });
     }
@@ -74,7 +77,7 @@ exports.updateUser = async (req, res) => {
     const { id } = req.params;
     const { role, adAccount, password } = req.body;
 
-    const user = await User.findById(id);
+    const user = await User.findByPk(id);
     if (!user) {
       return res.status(404).json({ message: 'Usuario no encontrado.' });
     }
@@ -82,7 +85,7 @@ exports.updateUser = async (req, res) => {
     if (role !== undefined) {
       const nextRole = resolveRole(role);
       if (user.role === 'ADMIN' && nextRole !== 'ADMIN') {
-        const adminCount = await User.countDocuments({ role: 'ADMIN' });
+        const adminCount = await User.count({ where: { role: 'ADMIN' } });
         if (adminCount <= 1) {
           return res
             .status(400)
@@ -115,25 +118,27 @@ exports.deleteUser = async (req, res) => {
   try {
     const { id } = req.params;
 
-    if (!mongoose.Types.ObjectId.isValid(id)) {
+    if (!isUUID(id)) {
       return res.status(400).json({ message: 'Identificador de usuario inválido.' });
     }
 
-    if (req.user && req.user._id && req.user._id.equals(id)) {
+    if (req.user && req.user._id && req.user._id === id) {
       return res
         .status(400)
         .json({ message: 'No puedes eliminar tu propia cuenta de acceso.' });
     }
 
-    const user = await User.findById(id);
+    const user = await User.findByPk(id);
     if (!user) {
       return res.status(404).json({ message: 'Usuario no encontrado.' });
     }
 
     if (user.role === 'ADMIN') {
-      const remainingAdmins = await User.countDocuments({
-        role: 'ADMIN',
-        _id: { $ne: user._id },
+      const remainingAdmins = await User.count({
+        where: {
+          role: 'ADMIN',
+          id: { [Op.ne]: user.id },
+        },
       });
 
       if (remainingAdmins === 0) {
@@ -143,7 +148,7 @@ exports.deleteUser = async (req, res) => {
       }
     }
 
-    await user.deleteOne();
+    await user.destroy();
 
     res.json({ message: 'Cuenta eliminada correctamente.' });
   } catch (error) {

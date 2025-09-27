@@ -1,12 +1,13 @@
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
+const { User } = require('../models');
 const { hashPassword, verifyPassword } = require('../utils/password');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-key';
 const JWT_EXPIRATION = '12h';
 
 function generateToken(user) {
-  return jwt.sign({ id: user._id, role: user.role }, JWT_SECRET, {
+  const id = user._id || user.id;
+  return jwt.sign({ id, role: user.role }, JWT_SECRET, {
     expiresIn: JWT_EXPIRATION,
   });
 }
@@ -24,8 +25,8 @@ async function getRequestingUser(req) {
 
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = await User.findById(payload.id);
-    return user;
+    const user = await User.findByPk(payload.id);
+    return user ? user.toJSON() : null;
   } catch (error) {
     return null;
   }
@@ -39,12 +40,14 @@ exports.register = async (req, res) => {
       return res.status(400).json({ message: 'Nombre, correo y contraseña son obligatorios.' });
     }
 
-    const existingUser = await User.findOne({ email: email.toLowerCase() });
+    const existingUser = await User.findOne({
+      where: { email: email.toLowerCase() },
+    });
     if (existingUser) {
       return res.status(409).json({ message: 'El correo ya está registrado.' });
     }
 
-    const totalUsers = await User.countDocuments();
+    const totalUsers = await User.count();
     let resolvedRole = role;
 
     if (totalUsers === 0) {
@@ -86,7 +89,9 @@ exports.login = async (req, res) => {
       return res.status(400).json({ message: 'Correo y contraseña son obligatorios.' });
     }
 
-    const user = await User.findOne({ email: email.toLowerCase() });
+    const user = await User.findOne({
+      where: { email: email.toLowerCase() },
+    });
     if (!user) {
       return res.status(401).json({ message: 'Credenciales inválidas.' });
     }
