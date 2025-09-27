@@ -1,5 +1,5 @@
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
+const { User } = require('../models');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-key';
 
@@ -18,13 +18,15 @@ async function authenticate(req, res, next) {
 
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = await User.findById(payload.id).select('-passwordHash');
+    const user = await User.findByPk(payload.id, {
+      attributes: { exclude: ['passwordHash'] },
+    });
 
     if (!user) {
       return res.status(401).json({ message: 'Usuario no encontrado.' });
     }
 
-    req.user = user;
+    req.user = user.toJSON();
     next();
   } catch (error) {
     console.error('authenticate error', error);

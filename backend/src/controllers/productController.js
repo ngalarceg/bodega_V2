@@ -1,16 +1,18 @@
-const mongoose = require('mongoose');
-const Product = require('../models/Product');
-const Assignment = require('../models/Assignment');
-const DispatchGuide = require('../models/DispatchGuide');
-const ProductModel = require('../models/ProductModel');
+const { Op, UniqueConstraintError, ValidationError } = require('sequelize');
+const { isUUID } = require('validator');
+const { sequelize, Product, Assignment, DispatchGuide, ProductModel, User } = require('../models');
 
 const ALLOWED_STATUSES = ['AVAILABLE', 'ASSIGNED', 'DECOMMISSIONED'];
 
-function buildSearchQuery({ type, status, search }) {
-  const query = {};
+function getUserId(user) {
+  return user?._id || user?.id || null;
+}
+
+function buildSearchOptions({ type, status, search }) {
+  const where = {};
 
   if (type && ['PURCHASED', 'RENTAL'].includes(type)) {
-    query.type = type;
+    where.type = type;
   }
 
   if (status) {
@@ -20,27 +22,70 @@ function buildSearchQuery({ type, status, search }) {
       .filter((value) => ALLOWED_STATUSES.includes(value));
 
     if (statusValues.length === 1) {
-      query.status = statusValues[0];
+      where.status = statusValues[0];
     } else if (statusValues.length > 1) {
-      query.status = { $in: statusValues };
+      where.status = { [Op.in]: statusValues };
     }
   }
 
   if (search) {
-    const regex = new RegExp(search, 'i');
-    query.$or = [
-      { name: regex },
-      { serialNumber: regex },
-      { partNumber: regex },
-      { inventoryNumber: regex },
-      { rentalId: regex },
+    const likeValue = `%${search.trim()}%`;
+    where[Op.or] = [
+      { name: { [Op.like]: likeValue } },
+      { serialNumber: { [Op.like]: likeValue } },
+      { partNumber: { [Op.like]: likeValue } },
+      { inventoryNumber: { [Op.like]: likeValue } },
+      { rentalId: { [Op.like]: likeValue } },
     ];
   }
 
-  return query;
+  return { where };
+}
+
+function includeForProduct(options = {}) {
+  const include = [
+    { model: DispatchGuide, as: 'dispatchGuide' },
+    { model: ProductModel, as: 'productModel' },
+    {
+      model: User,
+      as: 'decommissionedBy',
+      attributes: ['id', 'name', 'email', 'role'],
+    },
+  ];
+
+  if (options.withAssignments) {
+    include.push({
+      model: Assignment,
+      as: 'assignments',
+      include: [{ model: User, as: 'performedBy', attributes: ['id', 'name', 'email', 'role'] }],
+    });
+  }
+
+  return include;
+}
+
+async function findProductOr404(id, res, transaction) {
+  if (!isUUID(id)) {
+    res.status(400).json({ message: 'Identificador inválido.' });
+    return null;
+  }
+
+  const product = await Product.findByPk(id, {
+    include: includeForProduct(),
+    transaction,
+    lock: transaction ? transaction.LOCK.UPDATE : undefined,
+  });
+
+  if (!product) {
+    res.status(404).json({ message: 'Producto no encontrado.' });
+    return null;
+  }
+
+  return product;
 }
 
 exports.createProduct = async (req, res) => {
+  const transaction = await sequelize.transaction();
   try {
     const {
       productModelId,
@@ -54,113 +99,146 @@ exports.createProduct = async (req, res) => {
     } = req.body;
 
     if (!productModelId || !type) {
-      return res.status(400).json({ message: 'Debes indicar el modelo y el tipo del producto.' });
+      await transaction.rollback();
+      return res
+        .status(400)
+        .json({ message: 'Debes indicar el modelo y el tipo del producto.' });
     }
 
     const serializedFlag = typeof isSerialized === 'boolean' ? isSerialized : true;
     const sanitizedSerialNumber = typeof serialNumber === 'string' ? serialNumber.trim() : '';
 
     if (serializedFlag && !sanitizedSerialNumber) {
-      return res.status(400).json({ message: 'El número de serie es obligatorio para este producto.' });
+      await transaction.rollback();
+      return res
+        .status(400)
+        .json({ message: 'El número de serie es obligatorio para este producto.' });
     }
 
     if (!serializedFlag) {
       const parsedQuantity = Number(quantity);
       if (!Number.isFinite(parsedQuantity) || parsedQuantity <= 0) {
-        return res
-          .status(400)
-          .json({ message: 'Debes indicar la cantidad de unidades para el ingreso sin serie.' });
+        await transaction.rollback();
+        return res.status(400).json({
+          message: 'Debes indicar la cantidad de unidades para el ingreso sin serie.',
+        });
       }
     }
 
-    if (!mongoose.Types.ObjectId.isValid(productModelId)) {
+    if (!isUUID(productModelId)) {
+      await transaction.rollback();
       return res.status(400).json({ message: 'Identificador de modelo de producto inválido.' });
     }
 
-    const productModel = await ProductModel.findById(productModelId);
+    const productModel = await ProductModel.findByPk(productModelId, { transaction });
     if (!productModel) {
+      await transaction.rollback();
       return res.status(404).json({ message: 'Modelo de producto no encontrado.' });
     }
 
     if (!['PURCHASED', 'RENTAL'].includes(type)) {
+      await transaction.rollback();
       return res.status(400).json({ message: 'Tipo de producto inválido.' });
     }
 
     if (type === 'RENTAL' && !rentalId) {
-      return res.status(400).json({ message: 'Los productos de arriendo requieren un ID de arriendo.' });
+      await transaction.rollback();
+      return res
+        .status(400)
+        .json({ message: 'Los productos de arriendo requieren un ID de arriendo.' });
     }
 
     if (!dispatchGuideId) {
+      await transaction.rollback();
       return res.status(400).json({ message: 'Debes asociar el producto a una guía de despacho.' });
     }
 
-    if (!mongoose.Types.ObjectId.isValid(dispatchGuideId)) {
+    if (!isUUID(dispatchGuideId)) {
+      await transaction.rollback();
       return res.status(400).json({ message: 'Identificador de guía de despacho inválido.' });
     }
 
-    const dispatchGuide = await DispatchGuide.findById(dispatchGuideId);
+    const dispatchGuide = await DispatchGuide.findByPk(dispatchGuideId, { transaction });
     if (!dispatchGuide) {
+      await transaction.rollback();
       return res.status(404).json({ message: 'Guía de despacho no encontrada.' });
     }
 
     const normalizedQuantity = serializedFlag ? 1 : Math.max(1, Math.floor(Number(quantity)));
 
-    if (type === 'PURCHASED' && serializedFlag && !inventoryNumber) {
-      // El inventario es opcional, pero avisamos si falta.
-      console.warn('Producto de compra sin número de inventario, se almacenará vacío.');
+    if (serializedFlag) {
+      const existingSerial = await Product.findOne({
+        where: { serialNumber: sanitizedSerialNumber },
+        transaction,
+      });
+
+      if (existingSerial) {
+        await transaction.rollback();
+        return res
+          .status(409)
+          .json({ message: 'Ya existe un producto con ese número de serie.' });
+      }
     }
 
     const productPayload = {
-      productModel: productModel._id,
+      productModelId: productModel.id,
       name: productModel.name,
       description: productModel.description,
       type,
       isSerialized: serializedFlag,
-      serialNumber: serializedFlag ? sanitizedSerialNumber : undefined,
+      serialNumber: serializedFlag ? sanitizedSerialNumber : null,
       partNumber: productModel.partNumber,
       inventoryNumber:
-        type === 'PURCHASED' && serializedFlag ? inventoryNumber?.trim() || null : undefined,
-      rentalId: type === 'RENTAL' ? rentalId : undefined,
-      dispatchGuide: dispatchGuide._id,
-      createdBy: req.user._id,
+        type === 'PURCHASED' ? (inventoryNumber ? inventoryNumber.trim() || null : null) : null,
+      rentalId: type === 'RENTAL' ? rentalId : null,
+      dispatchGuideId: dispatchGuide.id,
+      createdById: getUserId(req.user),
       quantity: serializedFlag ? 1 : normalizedQuantity,
     };
 
-    if (type === 'PURCHASED' && !serializedFlag) {
-      productPayload.inventoryNumber = inventoryNumber ? inventoryNumber.trim() || null : null;
-    }
+    const product = await Product.create(productPayload, { transaction });
 
-    const product = await Product.create(productPayload);
+    await transaction.commit();
 
-    const populated = await product.populate('productModel');
+    const createdProduct = await Product.findByPk(product.id, {
+      include: includeForProduct(),
+    });
 
-    res.status(201).json(populated);
+    res.status(201).json(createdProduct.toJSON());
   } catch (error) {
+    await transaction.rollback();
     console.error('createProduct error', error);
-    if (error?.code === 11000) {
+    if (error instanceof UniqueConstraintError) {
       return res.status(409).json({ message: 'Ya existe un producto con ese número de serie.' });
+    }
+    if (error instanceof ValidationError) {
+      return res.status(400).json({ message: 'Datos inválidos para crear el producto.' });
     }
     res.status(500).json({ message: 'No se pudo crear el producto.' });
   }
 };
 
 exports.createProductsBulk = async (req, res) => {
+  const transaction = await sequelize.transaction();
   try {
     const { productModelId, type, serialNumbers, rentalId, dispatchGuideId } = req.body;
 
     if (!productModelId || !type) {
+      await transaction.rollback();
       return res
         .status(400)
         .json({ message: 'Debes indicar el modelo de producto y el tipo de ingreso.' });
     }
 
     if (!Array.isArray(serialNumbers) || serialNumbers.length === 0) {
-      return res
-        .status(400)
-        .json({ message: 'Ingresa al menos un número de serie para registrar los productos.' });
+      await transaction.rollback();
+      return res.status(400).json({
+        message: 'Ingresa al menos un número de serie para registrar los productos.',
+      });
     }
 
-    if (!mongoose.Types.ObjectId.isValid(productModelId)) {
+    if (!isUUID(productModelId)) {
+      await transaction.rollback();
       return res.status(400).json({ message: 'Identificador de modelo de producto inválido.' });
     }
 
@@ -169,6 +247,7 @@ exports.createProductsBulk = async (req, res) => {
       .filter(Boolean);
 
     if (!sanitizedSerials.length) {
+      await transaction.rollback();
       return res
         .status(400)
         .json({ message: 'Los números de serie ingresados no son válidos.' });
@@ -179,6 +258,7 @@ exports.createProductsBulk = async (req, res) => {
     );
 
     if (duplicatesInPayload.length) {
+      await transaction.rollback();
       return res.status(400).json({
         message: `Los siguientes números de serie están repetidos: ${[
           ...new Set(duplicatesInPayload),
@@ -186,68 +266,96 @@ exports.createProductsBulk = async (req, res) => {
       });
     }
 
-    const productModel = await ProductModel.findById(productModelId);
+    const productModel = await ProductModel.findByPk(productModelId, { transaction });
     if (!productModel) {
+      await transaction.rollback();
       return res.status(404).json({ message: 'Modelo de producto no encontrado.' });
     }
 
     if (!['PURCHASED', 'RENTAL'].includes(type)) {
+      await transaction.rollback();
       return res.status(400).json({ message: 'Tipo de producto inválido.' });
     }
 
     if (type === 'RENTAL' && !rentalId) {
+      await transaction.rollback();
       return res
         .status(400)
         .json({ message: 'Los productos de arriendo requieren un ID de arriendo.' });
     }
 
     if (!dispatchGuideId) {
-      return res.status(400).json({ message: 'Debes asociar los productos a una guía de despacho.' });
+      await transaction.rollback();
+      return res
+        .status(400)
+        .json({ message: 'Debes asociar los productos a una guía de despacho.' });
     }
 
-    if (!mongoose.Types.ObjectId.isValid(dispatchGuideId)) {
+    if (!isUUID(dispatchGuideId)) {
+      await transaction.rollback();
       return res.status(400).json({ message: 'Identificador de guía de despacho inválido.' });
     }
 
-    const dispatchGuide = await DispatchGuide.findById(dispatchGuideId);
+    const dispatchGuide = await DispatchGuide.findByPk(dispatchGuideId, { transaction });
     if (!dispatchGuide) {
+      await transaction.rollback();
       return res.status(404).json({ message: 'Guía de despacho no encontrada.' });
     }
 
-    const existingProducts = await Product.find(
-      { serialNumber: { $in: sanitizedSerials } },
-      'serialNumber'
-    );
+    const existingProducts = await Product.findAll({
+      where: {
+        serialNumber: {
+          [Op.in]: sanitizedSerials,
+        },
+      },
+      attributes: ['serialNumber'],
+      transaction,
+    });
 
     if (existingProducts.length) {
+      await transaction.rollback();
       const existingSerials = existingProducts.map((product) => product.serialNumber);
       return res.status(409).json({
         message: `Ya existen productos registrados con los números de serie: ${existingSerials.join(', ')}.`,
       });
     }
 
-    const toCreate = sanitizedSerials.map((serialNumber) => ({
-      productModel: productModel._id,
+    const toCreate = sanitizedSerials.map((serial) => ({
+      productModelId: productModel.id,
       name: productModel.name,
       description: productModel.description,
       type,
       isSerialized: true,
-      serialNumber,
+      serialNumber: serial,
       partNumber: productModel.partNumber,
-      inventoryNumber: type === 'PURCHASED' ? null : undefined,
-      rentalId: type === 'RENTAL' ? rentalId : undefined,
-      dispatchGuide: dispatchGuide._id,
-      createdBy: req.user._id,
+      inventoryNumber: type === 'PURCHASED' ? null : null,
+      rentalId: type === 'RENTAL' ? rentalId : null,
+      dispatchGuideId: dispatchGuide.id,
+      createdById: getUserId(req.user),
       quantity: 1,
     }));
 
-    const createdProducts = await Product.insertMany(toCreate);
-    const populatedProducts = await Product.populate(createdProducts, { path: 'productModel' });
+    const createdProducts = await Product.bulkCreate(toCreate, {
+      returning: true,
+      transaction,
+    });
 
-    res.status(201).json({ products: populatedProducts });
+    await transaction.commit();
+
+    const populatedProducts = await Product.findAll({
+      where: {
+        id: {
+          [Op.in]: createdProducts.map((product) => product.id),
+        },
+      },
+      include: includeForProduct(),
+    });
+
+    res.status(201).json({ products: populatedProducts.map((product) => product.toJSON()) });
   } catch (error) {
+    await transaction.rollback();
     console.error('createProductsBulk error', error);
-    if (error?.code === 11000) {
+    if (error instanceof UniqueConstraintError) {
       return res.status(409).json({ message: 'Algunos números de serie ya están registrados.' });
     }
     res.status(500).json({ message: 'No se pudieron crear los productos.' });
@@ -256,13 +364,13 @@ exports.createProductsBulk = async (req, res) => {
 
 exports.listProducts = async (req, res) => {
   try {
-    const query = buildSearchQuery(req.query);
-    const products = await Product.find(query)
-      .populate('dispatchGuide')
-      .populate('productModel')
-      .populate('decommissionedBy', 'name email role')
-      .sort({ createdAt: -1 });
-    res.json(products);
+    const options = buildSearchOptions(req.query);
+    const products = await Product.findAll({
+      ...options,
+      include: includeForProduct(),
+      order: [['createdAt', 'DESC']],
+    });
+    res.json(products.map((product) => product.toJSON()));
   } catch (error) {
     console.error('listProducts error', error);
     res.status(500).json({ message: 'No se pudieron obtener los productos.' });
@@ -271,19 +379,18 @@ exports.listProducts = async (req, res) => {
 
 exports.getProduct = async (req, res) => {
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+    if (!isUUID(req.params.id)) {
       return res.status(400).json({ message: 'Identificador inválido.' });
     }
 
-    const product = await Product.findById(req.params.id)
-      .populate('dispatchGuide')
-      .populate('productModel')
-      .populate('decommissionedBy', 'name email role');
+    const product = await Product.findByPk(req.params.id, {
+      include: includeForProduct(),
+    });
     if (!product) {
       return res.status(404).json({ message: 'Producto no encontrado.' });
     }
 
-    res.json(product);
+    res.json(product.toJSON());
   } catch (error) {
     console.error('getProduct error', error);
     res.status(500).json({ message: 'No se pudo obtener el producto.' });
@@ -291,8 +398,10 @@ exports.getProduct = async (req, res) => {
 };
 
 exports.updateProduct = async (req, res) => {
+  const transaction = await sequelize.transaction();
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+    if (!isUUID(req.params.id)) {
+      await transaction.rollback();
       return res.status(400).json({ message: 'Identificador inválido.' });
     }
 
@@ -309,58 +418,73 @@ exports.updateProduct = async (req, res) => {
     const updates = Object.keys(req.body).filter((key) => allowedUpdates.includes(key));
 
     if (!updates.length) {
+      await transaction.rollback();
       return res.status(400).json({ message: 'No hay campos válidos para actualizar.' });
     }
 
-    const product = await Product.findById(req.params.id);
+    const product = await Product.findByPk(req.params.id, { transaction });
     if (!product) {
+      await transaction.rollback();
       return res.status(404).json({ message: 'Producto no encontrado.' });
     }
 
     for (const key of updates) {
       if (key === 'dispatchGuideId') {
-        const dispatchGuideId = req.body.dispatchGuideId;
-        if (!dispatchGuideId) {
-          return res.status(400).json({ message: 'Los productos deben permanecer asociados a una guía de despacho.' });
+        const nextDispatchGuideId = req.body.dispatchGuideId;
+        if (!nextDispatchGuideId) {
+          await transaction.rollback();
+          return res.status(400).json({
+            message: 'Los productos deben permanecer asociados a una guía de despacho.',
+          });
         }
-        if (!mongoose.Types.ObjectId.isValid(dispatchGuideId)) {
+        if (!isUUID(nextDispatchGuideId)) {
+          await transaction.rollback();
           return res.status(400).json({ message: 'Identificador de guía de despacho inválido.' });
         }
-        const dispatchGuide = await DispatchGuide.findById(dispatchGuideId);
+        const dispatchGuide = await DispatchGuide.findByPk(nextDispatchGuideId, { transaction });
         if (!dispatchGuide) {
+          await transaction.rollback();
           return res.status(404).json({ message: 'Guía de despacho no encontrada.' });
         }
-        product.dispatchGuide = dispatchGuide._id;
+        product.dispatchGuideId = dispatchGuide.id;
       } else if (key === 'productModelId') {
-        const productModelId = req.body.productModelId;
-        if (!productModelId || !mongoose.Types.ObjectId.isValid(productModelId)) {
-          return res.status(400).json({ message: 'Identificador de modelo de producto inválido.' });
+        const nextProductModelId = req.body.productModelId;
+        if (!nextProductModelId || !isUUID(nextProductModelId)) {
+          await transaction.rollback();
+          return res
+            .status(400)
+            .json({ message: 'Identificador de modelo de producto inválido.' });
         }
-        const productModel = await ProductModel.findById(productModelId);
+        const productModel = await ProductModel.findByPk(nextProductModelId, { transaction });
         if (!productModel) {
+          await transaction.rollback();
           return res.status(404).json({ message: 'Modelo de producto no encontrado.' });
         }
-        product.productModel = productModel._id;
+        product.productModelId = productModel.id;
         product.name = productModel.name;
         product.partNumber = productModel.partNumber;
         product.description = productModel.description;
       } else if (key === 'serialNumber') {
         if (!product.isSerialized) {
+          await transaction.rollback();
           return res
             .status(400)
             .json({ message: 'Los registros sin serie no pueden editar este campo.' });
         }
         const nextSerial = typeof req.body.serialNumber === 'string' ? req.body.serialNumber.trim() : '';
         if (!nextSerial) {
+          await transaction.rollback();
           return res.status(400).json({ message: 'El número de serie no puede quedar vacío.' });
         }
         product.serialNumber = nextSerial;
       } else if (key === 'quantity') {
         if (product.isSerialized) {
+          await transaction.rollback();
           return res.status(400).json({ message: 'La cantidad solo aplica a productos sin serie.' });
         }
         const parsedQuantity = Number(req.body.quantity);
         if (!Number.isFinite(parsedQuantity) || parsedQuantity <= 0) {
+          await transaction.rollback();
           return res.status(400).json({ message: 'Ingresa una cantidad válida (mayor o igual a 1).' });
         }
         product.quantity = Math.max(1, Math.floor(parsedQuantity));
@@ -369,20 +493,30 @@ exports.updateProduct = async (req, res) => {
       }
     }
 
-    await product.save();
+    await product.save({ transaction });
+    await transaction.commit();
 
-    const populated = await product.populate('productModel');
+    const updatedProduct = await Product.findByPk(product.id, {
+      include: includeForProduct(),
+    });
 
-    res.json(populated);
+    res.json(updatedProduct.toJSON());
   } catch (error) {
+    await transaction.rollback();
     console.error('updateProduct error', error);
+    if (error instanceof UniqueConstraintError) {
+      return res.status(409).json({ message: 'Ya existe un producto con ese número de serie.' });
+    }
     res.status(500).json({ message: 'No se pudo actualizar el producto.' });
   }
 };
 
 exports.assignProduct = async (req, res) => {
+  const transaction = await sequelize.transaction();
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+    const { id } = req.params;
+    if (!isUUID(id)) {
+      await transaction.rollback();
       return res.status(400).json({ message: 'Identificador inválido.' });
     }
 
@@ -393,49 +527,56 @@ exports.assignProduct = async (req, res) => {
     const sanitizedLocation = typeof location === 'string' ? location.trim() : '';
 
     if (!sanitizedAssignedTo || !sanitizedAssignedEmail || !sanitizedLocation) {
-      return res
-        .status(400)
-        .json({ message: 'Usuario, correo electrónico y ubicación son obligatorios.' });
+      await transaction.rollback();
+      return res.status(400).json({
+        message: 'Usuario, correo electrónico y ubicación son obligatorios.',
+      });
     }
 
-    const product = await Product.findById(req.params.id);
+    const product = await Product.findByPk(id, {
+      transaction,
+      lock: transaction.LOCK.UPDATE,
+    });
     if (!product) {
+      await transaction.rollback();
       return res.status(404).json({ message: 'Producto no encontrado.' });
     }
 
     if (!product.isSerialized) {
-      return res
-        .status(400)
-        .json({
-          message:
-            'Este registro corresponde a un ingreso por cantidad y no admite asignaciones individuales.',
-        });
+      await transaction.rollback();
+      return res.status(400).json({
+        message:
+          'Este registro corresponde a un ingreso por cantidad y no admite asignaciones individuales.',
+      });
     }
 
     if (product.status === 'DECOMMISSIONED') {
+      await transaction.rollback();
       return res.status(400).json({ message: 'El producto está dado de baja y no puede asignarse.' });
     }
 
     const effectiveAssignmentDate = assignmentDate ? new Date(assignmentDate) : new Date();
 
     if (product.status !== 'AVAILABLE' || product.currentAssignment) {
+      await transaction.rollback();
       return res.status(400).json({
         message: 'Debes liberar el producto antes de asignarlo a otra persona.',
       });
     }
 
-    const assignment = await Assignment.create({
-      product: product._id,
-      action: 'ASSIGN',
-      assignedTo: sanitizedAssignedTo,
-      assignedEmail: sanitizedAssignedEmail,
-      location: sanitizedLocation,
-      assignmentDate: effectiveAssignmentDate,
-      performedBy: req.user._id,
-      notes,
-    });
-
-    await assignment.populate('performedBy', 'name email role');
+    const assignment = await Assignment.create(
+      {
+        productId: product.id,
+        action: 'ASSIGN',
+        assignedTo: sanitizedAssignedTo,
+        assignedEmail: sanitizedAssignedEmail,
+        location: sanitizedLocation,
+        assignmentDate: effectiveAssignmentDate,
+        performedById: getUserId(req.user),
+        notes,
+      },
+      { transaction }
+    );
 
     product.currentAssignment = {
       assignedTo: sanitizedAssignedTo,
@@ -443,152 +584,194 @@ exports.assignProduct = async (req, res) => {
       location: sanitizedLocation,
       assignmentDate: effectiveAssignmentDate,
     };
-
     product.status = 'ASSIGNED';
-    product.decommissionReason = undefined;
-    product.decommissionedAt = undefined;
-    product.decommissionedBy = undefined;
+    product.decommissionReason = null;
+    product.decommissionedAt = null;
+    product.decommissionedById = null;
 
-    await product.save();
+    await product.save({ transaction });
 
-    const updatedProduct = await product.populate([
-      { path: 'dispatchGuide' },
-      { path: 'productModel' },
-    ]);
+    await transaction.commit();
 
-    res.json({ product: updatedProduct, assignment });
+    const updatedProduct = await Product.findByPk(product.id, {
+      include: includeForProduct(),
+    });
+
+    const populatedAssignment = await Assignment.findByPk(assignment.id, {
+      include: [{ model: User, as: 'performedBy', attributes: ['id', 'name', 'email', 'role'] }],
+    });
+
+    res.json({ product: updatedProduct.toJSON(), assignment: populatedAssignment.toJSON() });
   } catch (error) {
+    await transaction.rollback();
     console.error('assignProduct error', error);
     res.status(500).json({ message: 'No se pudo asignar el producto.' });
   }
 };
 
 exports.unassignProduct = async (req, res) => {
+  const transaction = await sequelize.transaction();
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+    const { id } = req.params;
+    if (!isUUID(id)) {
+      await transaction.rollback();
       return res.status(400).json({ message: 'Identificador inválido.' });
     }
 
     const { location, assignmentDate, notes } = req.body;
     const sanitizedLocation = typeof location === 'string' ? location.trim() : '';
 
-    const product = await Product.findById(req.params.id);
+    const product = await Product.findByPk(id, {
+      transaction,
+      lock: transaction.LOCK.UPDATE,
+    });
     if (!product) {
+      await transaction.rollback();
       return res.status(404).json({ message: 'Producto no encontrado.' });
     }
 
     if (!product.isSerialized) {
-      return res
-        .status(400)
-        .json({ message: 'Este registro se administra por cantidad y no posee asignaciones activas.' });
+      await transaction.rollback();
+      return res.status(400).json({
+        message: 'Este registro se administra por cantidad y no posee asignaciones activas.',
+      });
     }
 
     if (product.status === 'DECOMMISSIONED') {
+      await transaction.rollback();
       return res.status(400).json({ message: 'El producto se encuentra dado de baja.' });
     }
 
     if (!product.currentAssignment) {
+      await transaction.rollback();
       return res.status(400).json({ message: 'El producto no tiene una asignación activa.' });
     }
 
     const effectiveAssignmentDate = assignmentDate ? new Date(assignmentDate) : new Date();
 
-    const assignment = await Assignment.create({
-      product: product._id,
-      action: 'UNASSIGN',
-      assignedTo: product.currentAssignment.assignedTo,
-      assignedEmail: product.currentAssignment.assignedEmail,
-      location: sanitizedLocation || product.currentAssignment.location,
-      assignmentDate: effectiveAssignmentDate,
-      performedBy: req.user._id,
-      notes,
+    const assignment = await Assignment.create(
+      {
+        productId: product.id,
+        action: 'UNASSIGN',
+        assignedTo: product.currentAssignment.assignedTo,
+        assignedEmail: product.currentAssignment.assignedEmail,
+        location: sanitizedLocation || product.currentAssignment.location,
+        assignmentDate: effectiveAssignmentDate,
+        performedById: getUserId(req.user),
+        notes,
+      },
+      { transaction }
+    );
+
+    product.currentAssignment = null;
+    product.status = 'AVAILABLE';
+
+    await product.save({ transaction });
+
+    await transaction.commit();
+
+    const updatedProduct = await Product.findByPk(product.id, {
+      include: includeForProduct(),
     });
 
-    await assignment.populate('performedBy', 'name email role');
+    const populatedAssignment = await Assignment.findByPk(assignment.id, {
+      include: [{ model: User, as: 'performedBy', attributes: ['id', 'name', 'email', 'role'] }],
+    });
 
-    product.currentAssignment = undefined;
-    product.status = 'AVAILABLE';
-    await product.save();
-
-    const updatedProduct = await product.populate([
-      { path: 'dispatchGuide' },
-      { path: 'productModel' },
-    ]);
-
-    res.json({ product: updatedProduct, assignment });
+    res.json({ product: updatedProduct.toJSON(), assignment: populatedAssignment.toJSON() });
   } catch (error) {
+    await transaction.rollback();
     console.error('unassignProduct error', error);
     res.status(500).json({ message: 'No se pudo desasignar el producto.' });
   }
 };
 
 exports.decommissionProduct = async (req, res) => {
+  const transaction = await sequelize.transaction();
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+    const { id } = req.params;
+    if (!isUUID(id)) {
+      await transaction.rollback();
       return res.status(400).json({ message: 'Identificador inválido.' });
     }
 
     const { reason } = req.body;
 
     if (!reason || !reason.trim()) {
+      await transaction.rollback();
       return res.status(400).json({ message: 'Debes indicar el motivo de la baja.' });
     }
 
-    const product = await Product.findById(req.params.id);
+    const product = await Product.findByPk(id, {
+      transaction,
+      lock: transaction.LOCK.UPDATE,
+    });
     if (!product) {
+      await transaction.rollback();
       return res.status(404).json({ message: 'Producto no encontrado.' });
     }
 
     if (product.status === 'DECOMMISSIONED') {
+      await transaction.rollback();
       return res.status(400).json({ message: 'El producto ya se encuentra dado de baja.' });
     }
 
     if (product.currentAssignment) {
+      await transaction.rollback();
       return res
         .status(400)
         .json({ message: 'Debes liberar la asignación antes de dar de baja el producto.' });
     }
 
-    product.currentAssignment = undefined;
+    product.currentAssignment = null;
     product.status = 'DECOMMISSIONED';
     product.decommissionReason = reason.trim();
     product.decommissionedAt = new Date();
-    product.decommissionedBy = req.user._id;
+    product.decommissionedById = getUserId(req.user);
 
-    await product.save();
+    await product.save({ transaction });
 
-    const populated = await product.populate([
-      { path: 'dispatchGuide' },
-      { path: 'decommissionedBy', select: 'name email role' },
-    ]);
+    await transaction.commit();
 
-    res.json(populated);
+    const populated = await Product.findByPk(product.id, {
+      include: includeForProduct(),
+    });
+
+    res.json(populated.toJSON());
   } catch (error) {
+    await transaction.rollback();
     console.error('decommissionProduct error', error);
     res.status(500).json({ message: 'No se pudo dar de baja el producto.' });
   }
 };
 
 exports.deleteProduct = async (req, res) => {
+  const transaction = await sequelize.transaction();
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+    if (!isUUID(req.params.id)) {
+      await transaction.rollback();
       return res.status(400).json({ message: 'Identificador inválido.' });
     }
 
-    const product = await Product.findById(req.params.id);
+    const product = await Product.findByPk(req.params.id, { transaction });
     if (!product) {
+      await transaction.rollback();
       return res.status(404).json({ message: 'Producto no encontrado.' });
     }
 
     if (product.currentAssignment || product.status === 'ASSIGNED') {
+      await transaction.rollback();
       return res.status(400).json({ message: 'Debes liberar el producto antes de eliminarlo.' });
     }
 
-    await Assignment.deleteMany({ product: product._id });
-    await product.deleteOne();
+    await Assignment.destroy({ where: { productId: product.id }, transaction });
+    await product.destroy({ transaction });
+
+    await transaction.commit();
 
     res.status(204).send();
   } catch (error) {
+    await transaction.rollback();
     console.error('deleteProduct error', error);
     res.status(500).json({ message: 'No se pudo eliminar el producto.' });
   }
@@ -596,15 +779,17 @@ exports.deleteProduct = async (req, res) => {
 
 exports.getAssignmentHistory = async (req, res) => {
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+    if (!isUUID(req.params.id)) {
       return res.status(400).json({ message: 'Identificador inválido.' });
     }
 
-    const assignments = await Assignment.find({ product: req.params.id })
-      .populate('performedBy', 'name email role')
-      .sort({ assignmentDate: -1 });
+    const assignments = await Assignment.findAll({
+      where: { productId: req.params.id },
+      include: [{ model: User, as: 'performedBy', attributes: ['id', 'name', 'email', 'role'] }],
+      order: [['assignmentDate', 'DESC']],
+    });
 
-    res.json(assignments);
+    res.json(assignments.map((assignment) => assignment.toJSON()));
   } catch (error) {
     console.error('getAssignmentHistory error', error);
     res.status(500).json({ message: 'No se pudo obtener el historial de asignaciones.' });
@@ -638,7 +823,7 @@ function buildHistoryFileName(product) {
   }
 
   if (!segments.length) {
-    segments.push(product?._id?.toString() || 'producto');
+    segments.push(product?._id || product?.id || 'producto');
   }
 
   const rawName = segments.join('-');
@@ -815,25 +1000,27 @@ function generatePdfBufferFromLines(lines) {
 
 exports.downloadAssignmentHistoryPdf = async (req, res) => {
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+    if (!isUUID(req.params.id)) {
       return res.status(400).json({ message: 'Identificador inválido.' });
     }
 
-    const product = await Product.findById(req.params.id)
-      .populate('dispatchGuide')
-      .populate('productModel');
+    const product = await Product.findByPk(req.params.id, {
+      include: includeForProduct(),
+    });
 
     if (!product) {
       return res.status(404).json({ message: 'Producto no encontrado.' });
     }
 
-    const assignments = await Assignment.find({ product: product._id })
-      .populate('performedBy', 'name email role')
-      .sort({ assignmentDate: -1 });
+    const assignments = await Assignment.findAll({
+      where: { productId: product.id },
+      include: [{ model: User, as: 'performedBy', attributes: ['id', 'name', 'email', 'role'] }],
+      order: [['assignmentDate', 'DESC']],
+    });
 
-    const lines = buildHistoryLines(product, assignments);
+    const lines = buildHistoryLines(product.toJSON(), assignments.map((assignment) => assignment.toJSON()));
     const pdfBuffer = generatePdfBufferFromLines(lines);
-    const fileName = buildHistoryFileName(product);
+    const fileName = buildHistoryFileName(product.toJSON());
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
@@ -851,86 +1038,66 @@ exports.downloadAssignmentHistoryPdf = async (req, res) => {
 
 exports.getStockSummary = async (req, res) => {
   try {
-    const summary = await Product.aggregate([
-      {
-        $addFields: {
-          quantityValue: {
-            $cond: [{ $gt: ['$quantity', 0] }, '$quantity', 1],
-          },
-        },
-      },
-      {
-        $group: {
-          _id: {
-            productModel: '$productModel',
-            name: '$name',
-            partNumber: '$partNumber',
-          },
-          description: { $first: '$description' },
-          total: { $sum: '$quantityValue' },
-          available: {
-            $sum: {
-              $cond: [{ $eq: ['$status', 'AVAILABLE'] }, '$quantityValue', 0],
-            },
-          },
-          assigned: {
-            $sum: {
-              $cond: [{ $eq: ['$status', 'ASSIGNED'] }, '$quantityValue', 0],
-            },
-          },
-          decommissioned: {
-            $sum: {
-              $cond: [{ $eq: ['$status', 'DECOMMISSIONED'] }, '$quantityValue', 0],
-            },
-          },
-          purchased: {
-            $sum: {
-              $cond: [{ $eq: ['$type', 'PURCHASED'] }, '$quantityValue', 0],
-            },
-          },
-          rental: {
-            $sum: {
-              $cond: [{ $eq: ['$type', 'RENTAL'] }, '$quantityValue', 0],
-            },
-          },
-        },
-      },
-      {
-        $lookup: {
-          from: 'productmodels',
-          localField: '_id.productModel',
-          foreignField: '_id',
-          as: 'productModel',
-        },
-      },
-      {
-        $unwind: {
-          path: '$productModel',
-          preserveNullAndEmptyArrays: true,
-        },
-      },
-      {
-        $project: {
-          productModelId: { $ifNull: ['$productModel._id', '$_id.productModel'] },
-          name: { $ifNull: ['$productModel.name', '$_id.name'] },
-          partNumber: { $ifNull: ['$productModel.partNumber', '$_id.partNumber'] },
-          description: { $ifNull: ['$productModel.description', '$description'] },
+    const products = await Product.findAll({
+      include: [{ model: ProductModel, as: 'productModel' }],
+    });
+
+    const summaryMap = new Map();
+
+    products.forEach((productInstance) => {
+      const product = productInstance.toJSON();
+      const quantityValue = product.quantity && product.quantity > 0 ? product.quantity : 1;
+      const modelId = product.productModel?._id || product.productModelId;
+      const key = modelId || `${product.name}|${product.partNumber}`;
+
+      if (!summaryMap.has(key)) {
+        summaryMap.set(key, {
+          productModelId: modelId || null,
+          name: product.productModel?.name || product.name,
+          partNumber: product.productModel?.partNumber || product.partNumber,
+          description: product.productModel?.description || product.description,
           totals: {
-            total: '$total',
-            available: '$available',
-            assigned: '$assigned',
-            decommissioned: '$decommissioned',
+            total: 0,
+            available: 0,
+            assigned: 0,
+            decommissioned: 0,
           },
           typeBreakdown: {
-            purchased: '$purchased',
-            rental: '$rental',
+            purchased: 0,
+            rental: 0,
           },
-        },
-      },
-      {
-        $sort: { name: 1, partNumber: 1 },
-      },
-    ]);
+        });
+      }
+
+      const entry = summaryMap.get(key);
+      entry.totals.total += quantityValue;
+      if (product.status === 'AVAILABLE') {
+        entry.totals.available += quantityValue;
+      } else if (product.status === 'ASSIGNED') {
+        entry.totals.assigned += quantityValue;
+      } else if (product.status === 'DECOMMISSIONED') {
+        entry.totals.decommissioned += quantityValue;
+      }
+
+      if (product.type === 'PURCHASED') {
+        entry.typeBreakdown.purchased += quantityValue;
+      } else if (product.type === 'RENTAL') {
+        entry.typeBreakdown.rental += quantityValue;
+      }
+    });
+
+    const summary = Array.from(summaryMap.values()).sort((a, b) => {
+      if (a.name && b.name) {
+        const nameComparison = a.name.localeCompare(b.name);
+        if (nameComparison !== 0) {
+          return nameComparison;
+        }
+      }
+      if (a.partNumber && b.partNumber) {
+        return a.partNumber.localeCompare(b.partNumber);
+      }
+      return 0;
+    });
 
     res.json(summary);
   } catch (error) {

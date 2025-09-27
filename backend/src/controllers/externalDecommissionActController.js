@@ -1,7 +1,11 @@
 const path = require('path');
 const fs = require('fs');
-const mongoose = require('mongoose');
-const ExternalDecommissionAct = require('../models/ExternalDecommissionAct');
+const { isUUID } = require('validator');
+const { ExternalDecommissionAct, User } = require('../models');
+
+function getUserId(user) {
+  return user?._id || user?.id || null;
+}
 
 exports.createExternalDecommissionAct = async (req, res) => {
   try {
@@ -35,10 +39,10 @@ exports.createExternalDecommissionAct = async (req, res) => {
       storedFileName: file.filename,
       fileSize: file.size,
       mimeType: file.mimetype,
-      uploadedBy: req.user._id,
+      uploadedById: getUserId(req.user),
     });
 
-    res.status(201).json(act);
+    res.status(201).json(act.toJSON());
   } catch (error) {
     console.error('createExternalDecommissionAct error', error);
     res.status(500).json({ message: 'No se pudo registrar el acta de baja externa.' });
@@ -47,10 +51,14 @@ exports.createExternalDecommissionAct = async (req, res) => {
 
 exports.listExternalDecommissionActs = async (req, res) => {
   try {
-    const acts = await ExternalDecommissionAct.find()
-      .populate('uploadedBy', 'name email role')
-      .sort({ recordDate: -1, createdAt: -1 });
-    res.json(acts);
+    const acts = await ExternalDecommissionAct.findAll({
+      include: [{ model: User, as: 'uploadedBy', attributes: ['id', 'name', 'email', 'role'] }],
+      order: [
+        ['recordDate', 'DESC'],
+        ['createdAt', 'DESC'],
+      ],
+    });
+    res.json(acts.map((act) => act.toJSON()));
   } catch (error) {
     console.error('listExternalDecommissionActs error', error);
     res.status(500).json({ message: 'No se pudieron obtener las actas de bajas externas.' });
@@ -59,19 +67,18 @@ exports.listExternalDecommissionActs = async (req, res) => {
 
 exports.getExternalDecommissionAct = async (req, res) => {
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+    if (!isUUID(req.params.id)) {
       return res.status(400).json({ message: 'Identificador inválido.' });
     }
 
-    const act = await ExternalDecommissionAct.findById(req.params.id).populate(
-      'uploadedBy',
-      'name email role'
-    );
+    const act = await ExternalDecommissionAct.findByPk(req.params.id, {
+      include: [{ model: User, as: 'uploadedBy', attributes: ['id', 'name', 'email', 'role'] }],
+    });
     if (!act) {
       return res.status(404).json({ message: 'Acta de baja externa no encontrada.' });
     }
 
-    res.json(act);
+    res.json(act.toJSON());
   } catch (error) {
     console.error('getExternalDecommissionAct error', error);
     res.status(500).json({ message: 'No se pudo obtener el acta de baja externa.' });
@@ -80,11 +87,11 @@ exports.getExternalDecommissionAct = async (req, res) => {
 
 exports.downloadExternalDecommissionAct = async (req, res) => {
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+    if (!isUUID(req.params.id)) {
       return res.status(400).json({ message: 'Identificador inválido.' });
     }
 
-    const act = await ExternalDecommissionAct.findById(req.params.id);
+    const act = await ExternalDecommissionAct.findByPk(req.params.id);
     if (!act) {
       return res.status(404).json({ message: 'Acta de baja externa no encontrada.' });
     }
